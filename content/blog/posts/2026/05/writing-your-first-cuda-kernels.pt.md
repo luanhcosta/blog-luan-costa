@@ -130,7 +130,30 @@ nvcc -o idxing 01_idxing.cu
 ./idxing | head -20             # ordem real de execução
 ```
 
-Você vai ver que a saída não está em ordem. O scheduler da GPU atribui blocos a SMs com base na disponibilidade; não há ordenação garantida entre blocos. Isso é intencional e esperado.
+Aqui estão as primeiras linhas na RTX 5050, na ordem em que a GPU as imprimiu:
+
+```
+24 blocks/grid
+64 threads/block
+1536 total threads
+0256 | Block(0 2 0) =   4 | Thread(0 0 0) =   0
+0257 | Block(0 2 0) =   4 | Thread(1 0 0) =   1
+0258 | Block(0 2 0) =   4 | Thread(2 0 0) =   2
+0263 | Block(0 2 0) =   4 | Thread(3 1 0) =   7
+0260 | Block(0 2 0) =   4 | Thread(0 1 0) =   4
+```
+
+O primeiro bloco a imprimir foi o `(0,2,0)` — não o `(0,0,0)`. Após ordenar pelo ID global:
+
+```
+0000 | Block(0 0 0) =   0 | Thread(0 0 0) =   0
+0001 | Block(0 0 0) =   0 | Thread(1 0 0) =   1
+0002 | Block(0 0 0) =   0 | Thread(2 0 0) =   2
+0003 | Block(0 0 0) =   0 | Thread(3 0 0) =   3
+0004 | Block(0 0 0) =   0 | Thread(0 1 0) =   4
+```
+
+O scheduler da GPU atribuiu blocos a SMs com base na disponibilidade, não na ordem de lançamento. Isso é intencional e esperado.
 
 ### Indexação 1D: O Caso do Dia a Dia
 
@@ -228,6 +251,27 @@ nvcc -O2 -o vec_add 00_vector_add_v1.cu
 ./vec_add
 ```
 
+Rodando na RTX 5050 com `N = 10.000.000` elementos e 10 execuções cronometradas:
+
+```
+CPU average time:  4.360 ms
+GPU average time:  0.577 ms
+Speedup:           7.55x
+Results are correct
+```
+
+A GPU vence por 7,55× numa simples soma elemento a elemento — e este é um dos casos menos impressionantes para a GPU, já que o gargalo aqui é a largura de banda de memória (mover 120 MB de dados), não a aritmética. Para kernels mais intensivos em computação, a diferença é muito maior.
+
+**Grid 1D vs grid 3D** no mesmo problema de 10 milhões de elementos:
+
+```
+GPU 1D:  0.634 ms  (6.43x vs CPU)
+GPU 3D:  0.776 ms  (5.25x vs CPU)
+1D vs 3D: 1D é 1.22x mais rápido
+```
+
+O kernel 3D é mais lento apenas porque executa mais aritmética de indexação por thread (3 multiplicações em vez de 1). O overhead extra é medível mesmo para uma operação tão barata quanto a adição.
+
 ### Uma Nota sobre Grids 3D para Problemas 1D
 
 É perfeitamente válido organizar threads em um grid 3D mesmo para um problema 1D; o kernel simplesmente lineariza o índice 3D de volta para um índice plano de array:
@@ -295,6 +339,16 @@ O kernel ingênuo funciona, mas é limitado pela memória. Para uma matriz `1024
 Pior ainda, as leituras são redundantes. A thread `(0,0)` e a thread `(0,1)` leem a linha inteira `A[0][0..K-1]`. Essa linha é lida **N vezes**, uma por coluna de C. O mesmo dado é buscado da VRAM repetidamente.
 
 Esse não é um gargalo de computação; é um **gargalo de largura de banda de memória**. As unidades aritméticas da GPU ficam ociosas, esperando os dados chegarem da VRAM.
+
+Rodando o kernel ingênuo contra a CPU numa matriz `256×256 × 256×256` (`K=256`):
+
+```
+CPU average time:  4388 µs
+GPU average time:   115 µs
+Speedup:           38x
+```
+
+38× é um número grande, mas o kernel ingênuo está longe do ótimo — ele está deixando a maior parte do desempenho do hardware na mesa.
 
 ---
 
@@ -420,7 +474,17 @@ ncu --metrics l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum ./naive_matmul
 ncu --metrics l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum ./tiled_matmul
 ```
 
-A diferença é dramática. O kernel ingênuo é gargalado pela largura de banda de memória; o kernel com tiling move muito mais da computação para o regime da shared memory rápida.
+Aqui estão os resultados medidos na RTX 5050 para uma matriz `1024×1024`, com média de 20 execuções:
+
+```
+Kernel                    Tempo (ms)   TFLOPS
+Ingênuo (blocos 16×16)       2.977     0.721
+Tiled (TILE_SIZE=16)         2.088     1.029
+
+Speedup: 1.43x
+```
+
+O kernel com tiling entrega 1,43× o throughput e ultrapassa a marca de 1 TFLOP/s. O ganho cresce com o tamanho da matriz — em 1024×1024 o cache L2 já ajuda o kernel ingênuo um pouco; para matrizes maiores que não cabem no cache, a vantagem do tiling aumenta ainda mais.
 
 ---
 
@@ -453,7 +517,26 @@ Dois incrementos aconteceram, mas o counter só subiu 1.
 Isso é o "problema do update perdido".
 ```
 
-Rode isso com `NUM_BLOCKS = 1000` e `NUM_THREADS = 1000`: o resultado esperado é 1.000.000, mas a versão não-atômica produz um número aleatório menor; e diferente a cada execução.
+Rodando com `NUM_BLOCKS = 1000` e `NUM_THREADS = 1000`, aqui está a saída de 5 execuções consecutivas na RTX 5050:
+
+```
+Non-atomic counter value: 151
+Atomic counter value:     1000000
+
+Non-atomic counter value: 148
+Atomic counter value:     1000000
+
+Non-atomic counter value: 148
+Atomic counter value:     1000000
+
+Non-atomic counter value: 148
+Atomic counter value:     1000000
+
+Non-atomic counter value: 148
+Atomic counter value:     1000000
+```
+
+Esperado: 1.000.000. A versão não-atômica retorna ~148–151 — perdeu 99,98% dos incrementos para race conditions. O número também não é completamente aleatório: tende a estabilizar em torno de um valor baixo porque a GPU escalona todos os warps em lockstep apertado, então a maioria das threads lê o mesmo valor obsoleto antes que qualquer uma escreva de volta.
 
 ### A Solução: `atomicAdd`
 

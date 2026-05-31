@@ -1,7 +1,7 @@
 ---
 title: "Escrevendo seus Primeiros Kernels CUDA: Execução na GPU, Memória e Otimização"
 date: 2026-05-31
-description: "Um guia completo de programação CUDA do zero — indexação de threads, adição de vetores, multiplicação de matrizes com tiling em shared memory, atomics e streams assíncronos. Desenvolvido com RTX 5050 e CUDA 12.6."
+description: "Um guia completo de programação CUDA do zero: indexação de threads, adição de vetores, multiplicação de matrizes com tiling em shared memory, atomics e streams assíncronos. Desenvolvido com RTX 5050 e CUDA 12.6."
 authors:
   - name: Luan Costa
 ---
@@ -27,7 +27,7 @@ Antes de tocar em uma única linha de código CUDA, vale a pena entender por que
 
 A CPU é otimizada para rodar um número pequeno de threads o mais rápido possível. A GPU faz a aposta oposta: executar um número enorme de threads simultaneamente, e esconder a latência de operações lentas de memória trocando para outra thread enquanto uma está esperando dados. Isso se chama **hiding latency through occupancy**, e só funciona se você der à GPU threads suficientes para se manter ocupada.
 
-É por isso que kernels CUDA lançam milhões de threads. A GPU não está apenas oferecendo paralelismo — ela precisa do volume de trabalho para funcionar com eficiência.
+É por isso que kernels CUDA lançam milhões de threads. A GPU não está apenas oferecendo paralelismo; ela precisa do volume de trabalho para funcionar com eficiência.
 
 ### A Hierarquia Grid → Block → Thread
 
@@ -50,18 +50,18 @@ Todo lançamento de kernel CUDA cria uma hierarquia de três níveis de threads:
 ```
 
 - **Thread**: a menor unidade de execução. Cada thread roda o código do kernel de forma independente, e crucialmente, cada thread tem uma combinação única de `threadIdx` e `blockIdx` que permite determinar qual pedaço de dado processar.
-- **Block (Bloco)**: um grupo de threads que compartilha **memória compartilhada** (`__shared__`) e pode se sincronizar com `__syncthreads()`. Um bloco inteiro roda em um único **Streaming Multiprocessor (SM)** — um bloco nunca se divide entre SMs.
+- **Block (Bloco)**: um grupo de threads que compartilha **memória compartilhada** (`__shared__`) e pode se sincronizar com `__syncthreads()`. Um bloco inteiro roda em um único **Streaming Multiprocessor (SM)**: um bloco nunca se divide entre SMs.
 - **Grid**: todos os blocos de um lançamento. Blocos em partes diferentes do grid **não** se comunicam entre si, exceto através da memória global.
 
 ### Streaming Multiprocessors (SMs)
 
-Cada SM é uma unidade de processamento independente dentro da GPU. A RTX 5050 tem múltiplos SMs, cada um capaz de rodar dezenas de blocos simultaneamente. O scheduler da GPU distribui os blocos pelos SMs disponíveis de forma automática — você não controla esse mapeamento, e isso é intencional.
+Cada SM é uma unidade de processamento independente dentro da GPU. A RTX 5050 tem múltiplos SMs, cada um capaz de rodar dezenas de blocos simultaneamente. O scheduler da GPU distribui os blocos pelos SMs disponíveis de forma automática; você não controla esse mapeamento, e isso é intencional.
 
 A independência entre blocos é o que torna o CUDA escalável: o mesmo kernel roda igualmente bem em uma GPU com 10 SMs ou com 1.000 SMs. Mais SMs significa mais blocos executando ao mesmo tempo, mas o resultado é idêntico.
 
 ### Warps: A Unidade Real de Execução
 
-Dentro de um bloco, as threads são agrupadas em **warps de 32 threads**. Todos os threads de um warp executam a **mesma instrução ao mesmo tempo** — esse é o modelo SIMT (Single Instruction, Multiple Threads).
+Dentro de um bloco, as threads são agrupadas em **warps de 32 threads**. Todos os threads de um warp executam a **mesma instrução ao mesmo tempo**: esse é o modelo SIMT (Single Instruction, Multiple Threads).
 
 Isso tem uma consequência importante: se threads de um mesmo warp divergem em um `if/else`, a GPU executa os dois ramos *sequencialmente*, desativando as threads que não pertencem a cada ramo. Isso se chama **divergência de warp** e é uma fonte comum de ineficiência.
 
@@ -107,7 +107,7 @@ __global__ void whoami(void) {
 }
 ```
 
-A matemática do Passo 1 é exatamente o que o C usa para linearizar um índice de array 3D `(x, y, z)` em uma posição plana: `x + y*dimX + z*dimX*dimY`. Você está fazendo o mesmo — encontrando um índice único a partir de uma coordenada 3D.
+A matemática do Passo 1 é exatamente o que o C usa para linearizar um índice de array 3D `(x, y, z)` em uma posição plana: `x + y*dimX + z*dimX*dimY`. Você está fazendo o mesmo; encontrando um índice único a partir de uma coordenada 3D.
 
 A configuração de lançamento para esse kernel:
 
@@ -121,7 +121,7 @@ dim3 threadsPerBlock(t_x, t_y, t_z);
 whoami<<<blocksPerGrid, threadsPerBlock>>>();
 ```
 
-A sintaxe `<<<blocksPerGrid, threadsPerBlock>>>` é a **configuração de lançamento** — é onde você diz à GPU quantas threads criar.
+A sintaxe `<<<blocksPerGrid, threadsPerBlock>>>` é a **configuração de lançamento**: é onde você diz à GPU quantas threads criar.
 
 **Experimente:** rode o kernel e passe a saída por `sort`:
 ```bash
@@ -130,9 +130,9 @@ nvcc -o idxing 01_idxing.cu
 ./idxing | head -20             # ordem real de execução
 ```
 
-Você vai ver que a saída não está em ordem. O scheduler da GPU atribui blocos a SMs com base na disponibilidade — não há ordenação garantida entre blocos. Isso é intencional e esperado.
+Você vai ver que a saída não está em ordem. O scheduler da GPU atribui blocos a SMs com base na disponibilidade; não há ordenação garantida entre blocos. Isso é intencional e esperado.
 
-### Indexação 1D — O Caso do Dia a Dia
+### Indexação 1D: O Caso do Dia a Dia
 
 Na prática, a maioria dos kernels usa indexação 1D:
 
@@ -172,7 +172,7 @@ Esse padrão aparece em todos os exemplos a seguir. A abstração central é que
 
 ## Adição de Vetores: O "Hello World" da GPU
 
-Somar dois vetores elemento a elemento é o kernel paralelo mais simples — cada elemento é independente, então cada thread pode trabalhar no seu par sem nunca precisar falar com outra thread.
+Somar dois vetores elemento a elemento é o kernel paralelo mais simples; cada elemento é independente, então cada thread pode trabalhar no seu par sem nunca precisar falar com outra thread.
 
 ### Referência na CPU
 
@@ -230,7 +230,7 @@ nvcc -O2 -o vec_add 00_vector_add_v1.cu
 
 ### Uma Nota sobre Grids 3D para Problemas 1D
 
-É perfeitamente válido organizar threads em um grid 3D mesmo para um problema 1D — o kernel simplesmente lineariza o índice 3D de volta para um índice plano de array:
+É perfeitamente válido organizar threads em um grid 3D mesmo para um problema 1D; o kernel simplesmente lineariza o índice 3D de volta para um índice plano de array:
 
 ```c
 __global__ void vector_add_gpu_3d(float *a, float *b, float *c, int nx, int ny, int nz) {
@@ -294,7 +294,7 @@ O kernel ingênuo funciona, mas é limitado pela memória. Para uma matriz `1024
 
 Pior ainda, as leituras são redundantes. A thread `(0,0)` e a thread `(0,1)` leem a linha inteira `A[0][0..K-1]`. Essa linha é lida **N vezes**, uma por coluna de C. O mesmo dado é buscado da VRAM repetidamente.
 
-Esse não é um gargalo de computação — é um **gargalo de largura de banda de memória**. As unidades aritméticas da GPU ficam ociosas, esperando os dados chegarem da VRAM.
+Esse não é um gargalo de computação; é um **gargalo de largura de banda de memória**. As unidades aritméticas da GPU ficam ociosas, esperando os dados chegarem da VRAM.
 
 ---
 
@@ -353,7 +353,7 @@ __global__ void matmul_tiled(float *A, float *B, float *C, int M, int N, int K) 
     int row = by * TILE_SIZE + ty;
     int col = bx * TILE_SIZE + tx;
 
-    float sum = 0.0f;  // fica em registrador — rápido!
+    float sum = 0.0f;  // fica em registrador - rápido!
 
     for (int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
 
@@ -389,9 +389,9 @@ __global__ void matmul_tiled(float *A, float *B, float *C, int M, int N, int K) 
 
 Cada barreira serve a um propósito distinto:
 
-**Primeira barreira** — após o carregamento, antes de computar. Sem ela, uma thread rápida poderia começar a ler `sharedA[ty][k]` antes de uma thread lenta ter escrito esse valor. Você leria lixo.
+**Primeira barreira**: após o carregamento, antes de computar. Sem ela, uma thread rápida poderia começar a ler `sharedA[ty][k]` antes de uma thread lenta ter escrito esse valor. Você leria lixo.
 
-**Segunda barreira** — após computar, antes do carregamento do próximo tile. Sem ela, uma thread rápida poderia começar a sobrescrever a shared memory com o próximo tile enquanto uma thread lenta ainda está lendo os valores do tile atual.
+**Segunda barreira**: após computar, antes do carregamento do próximo tile. Sem ela, uma thread rápida poderia começar a sobrescrever a shared memory com o próximo tile enquanto uma thread lenta ainda está lendo os valores do tile atual.
 
 O diagrama de tempo deixa o modo de falha concreto:
 
@@ -410,7 +410,7 @@ Com `TILE_SIZE = 16`, um bloco de 16×16 threads carrega:
 - 256 floats de A (um tile)
 - 256 floats de B (um tile)
 
-Cada float na shared memory é lido **16 vezes** (uma vez por thread na outra dimensão), em vez de uma vez. O número de acessos à memória global cai de `2K` leituras por thread para `2K/TILE_SIZE` — uma **redução de 16× no tráfego de VRAM**.
+Cada float na shared memory é lido **16 vezes** (uma vez por thread na outra dimensão), em vez de uma vez. O número de acessos à memória global cai de `2K` leituras por thread para `2K/TILE_SIZE`; uma **redução de 16× no tráfego de VRAM**.
 
 Você pode medir isso diretamente com o profiler da NVIDIA:
 
@@ -453,7 +453,7 @@ Dois incrementos aconteceram, mas o counter só subiu 1.
 Isso é o "problema do update perdido".
 ```
 
-Rode isso com `NUM_BLOCKS = 1000` e `NUM_THREADS = 1000`: o resultado esperado é 1.000.000, mas a versão não-atômica produz um número aleatório menor — e diferente a cada execução.
+Rode isso com `NUM_BLOCKS = 1000` e `NUM_THREADS = 1000`: o resultado esperado é 1.000.000, mas a versão não-atômica produz um número aleatório menor; e diferente a cada execução.
 
 ### A Solução: `atomicAdd`
 
@@ -479,7 +479,7 @@ __global__ void incrementAtomico(int *counter) {
 
 ### Quando Atomics Prejudicam o Desempenho
 
-Atomics serializam acessos conflitantes. Se muitas threads competem pelo mesmo endereço (**alta contenção**), o desempenho cai drasticamente — as threads ficam na fila esperando sua vez.
+Atomics serializam acessos conflitantes. Se muitas threads competem pelo mesmo endereço (**alta contenção**), o desempenho cai drasticamente; as threads ficam na fila esperando sua vez.
 
 O padrão eficiente para reduções é reduzir dentro do bloco primeiro usando shared memory, depois usar um único atomic por bloco para combinar com o resultado global:
 
@@ -536,10 +536,10 @@ stream2:      [  cópia H2D B  ] [  kernel B  ] [  cópia D2H B  ]
 Transferências assíncronas requerem **pinned memory (memória fixada/pinada)** no host. A memória normal do `malloc` pode ser movida pelo SO a qualquer momento, o que quebra transferências DMA. Pinned memory é travada no lugar:
 
 ```c
-// Memória paginável normal — transferências async não são garantidas
+// Memória paginável normal - transferências async não são garantidas
 float *h_data = (float*)malloc(size);
 
-// Pinned memory — DMA verdadeiramente assíncrono
+// Pinned memory - DMA verdadeiramente assíncrono
 float *h_data;
 cudaMallocHost(&h_data, size);
 // ... usa h_data ...
@@ -555,7 +555,7 @@ cudaStream_t stream1, stream2;
 cudaStreamCreate(&stream1);
 cudaStreamCreate(&stream2);
 
-// Copia A e B em paralelo — streams diferentes!
+// Copia A e B em paralelo - streams diferentes!
 cudaMemcpyAsync(d_A, h_A, size, cudaMemcpyHostToDevice, stream1);
 cudaMemcpyAsync(d_B, h_B, size, cudaMemcpyHostToDevice, stream2);
 
@@ -575,7 +575,7 @@ cudaStreamDestroy(stream1);
 cudaStreamDestroy(stream2);
 ```
 
-O `cudaStreamSynchronize(stream2)` antes do lançamento do kernel é necessário porque o kernel usa `d_B`, que está sendo copiado em stream2. Streams diferentes não têm dependência de ordem implícita — se você não sincronizar explicitamente, o kernel pode iniciar antes que a cópia termine.
+O `cudaStreamSynchronize(stream2)` antes do lançamento do kernel é necessário porque o kernel usa `d_B`, que está sendo copiado em stream2. Streams diferentes não têm dependência de ordem implícita; se você não sincronizar explicitamente, o kernel pode iniciar antes que a cópia termine.
 
 ### Events: Sincronização Precisa Entre Streams
 
@@ -592,14 +592,14 @@ kernel1<<<grid, block, 0, stream1>>>(d_data, N);
 // Marca o ponto no stream1 onde o evento dispara
 cudaEventRecord(event, stream1);
 
-// Stream2 espera até o stream1 chegar no evento — a GPU gerencia isso
+// Stream2 espera até o stream1 chegar no evento - a GPU gerencia isso
 cudaStreamWaitEvent(stream2, event, 0);
 
 // Seguro usar dados produzidos pelo stream1
 kernel2<<<grid, block, 0, stream2>>>(d_data, N);
 ```
 
-`cudaStreamWaitEvent` é mais eficiente que `cudaStreamSynchronize` porque a CPU não bloqueia — o scheduler da GPU gerencia a dependência internamente.
+`cudaStreamWaitEvent` é mais eficiente que `cudaStreamSynchronize` porque a CPU não bloqueia; o scheduler da GPU gerencia a dependência internamente.
 
 ### Prioridades de Stream
 
@@ -649,10 +649,10 @@ O callback é executado na CPU quando a GPU chega a esse ponto no stream. Isso h
 
 Isso cobre a camada fundamental da programação CUDA. Os próximos passos naturais:
 
-**cuBLAS** — a biblioteca de álgebra linear production-grade da NVIDIA. Rode `cublasSgemm` nas mesmas matrizes e compare com seu kernel com tiling — será notavelmente mais rápido porque usa todos os truques de hardware (loads vetorizados, tensor cores, evitar bank conflicts) que levam meses para dominar.
+**cuBLAS**: a biblioteca de álgebra linear production-grade da NVIDIA. Rode `cublasSgemm` nas mesmas matrizes e compare com seu kernel com tiling; será notavelmente mais rápido porque usa todos os truques de hardware (loads vetorizados, tensor cores, evitar bank conflicts) que levam meses para dominar.
 
-**Occupancy** — aprenda a calcular a ocupância do SM (a razão entre warps ativos e o máximo teórico) e como ela se relaciona com o throughput. Uso de shared memory, contagem de registradores e tamanho do bloco afetam a ocupância, e otimizá-la é frequentemente a alavanca que fecha a diferença com o cuBLAS.
+**Occupancy**: aprenda a calcular a ocupância do SM (a razão entre warps ativos e o máximo teórico) e como ela se relaciona com o throughput. Uso de shared memory, contagem de registradores e tamanho do bloco afetam a ocupância, e otimizá-la é frequentemente a alavanca que fecha a diferença com o cuBLAS.
 
-**Acesso Coalescido à Memória** — os padrões de acesso que maximizam a largura de banda da memória global. O exemplo canônico é a transposição de matrizes: uma implementação ingênua lê linhas (coalescido) mas escreve colunas (strided, lento). Entender coalescing é essencial antes de otimizar qualquer coisa limitada por memória.
+**Acesso Coalescido à Memória**: os padrões de acesso que maximizam a largura de banda da memória global. O exemplo canônico é a transposição de matrizes: uma implementação ingênua lê linhas (coalescido) mas escreve colunas (strided, lento). Entender coalescing é essencial antes de otimizar qualquer coisa limitada por memória.
 
-**Triton** — uma linguagem embutida em Python para escrever kernels de GPU em um nível mais alto de abstração, que cuida automaticamente de tiling e shared memory. Triton é o que a maioria dos praticantes de ML usa hoje. Mas ele gera CUDA por baixo dos panos, e entender o que está neste post é o pré-requisito para avaliar se a saída do Triton é boa ou não.
+**Triton**: uma linguagem embutida em Python para escrever kernels de GPU em um nível mais alto de abstração, que cuida automaticamente de tiling e shared memory. Triton é o que a maioria dos praticantes de ML usa hoje. Mas ele gera CUDA por baixo dos panos, e entender o que está neste post é o pré-requisito para avaliar se a saída do Triton é boa ou não.

@@ -1,0 +1,10 @@
+{{- $lang := .Page.Language.Lang -}}
+{{- $blogPosts := where .Site.RegularPages "Section" "blog" -}}
+{{- $recentPosts := first 2 ($blogPosts.ByDate.Reverse) -}}
+{{- range $recentPosts -}}
+  <div class="hx:mb-10">
+    <h3><a style="color: inherit; text-decoration: none;" class="hx:block hx:font-semibold hx:mt-8 hx:text-2xl" href="{{ .RelPermalink }}">{{ .Title }}</a></h3>
+    <p class="hx:opacity-80 hx:mt-4 hx:leading-7">{{ .Description | default .Summary }}</p>
+    <p class="hx:opacity-50 hx:text-sm hx:mt-4 hx:leading-7">{{ partial "utils/format-date" .Date }}</p>
+  </div>
+{{- end -}}

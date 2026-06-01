@@ -11,6 +11,8 @@ toc: true
   {{< card link="blog" title="Blog" icon="book-open" >}}
 {{< /cards >}}
 
+{{< recent-posts >}}
+
 ## Sobre mim
 
 <img src="images/profile_photo.jpg" alt="Luan Costa" style="float: right; width: 220px; border-radius: 12px; margin: 2rem 0 1.5rem 2rem;">

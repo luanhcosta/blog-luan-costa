@@ -18,7 +18,9 @@ O DDPM enquadra a geração de imagens como a reversão de um processo de adiç�
 
 $$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \varepsilon, \quad \varepsilon \sim \mathcal{N}(0, I)$$
 
-onde $\bar{\alpha}_t = \prod_{s=1}^{t}(1 - \beta_s)$ é o produto cumulativo do noise schedule. Com um schedule linear de $\beta_1 = 10^{-4}$ a $\beta_T = 0.02$ ao longo de $T = 1000$ steps, o schedule se comporta assim:
+onde $\bar{\alpha}_t$ é o produto cumulativo do noise schedule:
+
+$$\bar{\alpha}_t = \prod_{s=1}^{t}(1 - \beta_s)$$ Com um schedule linear de $\beta_1 = 10^{-4}$ a $\beta_T = 0.02$ ao longo de $T = 1000$ steps, o schedule se comporta assim:
 
 {{< img src="images/noise_schedule.png" alt="DDPM Linear Noise Schedule — β, ᾱ, amplitude de sinal/ruído e SNR" >}}
 
@@ -40,7 +42,7 @@ Em t = 250 a forma ainda é fracamente visível — coerente com o cruzamento do
 
 O processo reverso $p_\theta(x_{t-1} \mid x_t)$ é parametrizado por uma U-Net que prediz o ruído $\varepsilon$ adicionado no timestep $t$, treinada com uma loss MSE simples:
 
-$$\mathcal{L} = \mathbb{E}_{x_0, t, \varepsilon}\left[\|\varepsilon - \varepsilon_\theta(x_t, t)\|^2\right]$$
+$$\mathcal{L} = \mathbb{E}_{x_0,\, t,\, \varepsilon}\left[\lVert\varepsilon - \varepsilon_\theta(x_t, t)\rVert^2\right]$$
 
 A arquitetura para imagens 28×28 usa três níveis de resolução com um bottleneck em 7×7:
 

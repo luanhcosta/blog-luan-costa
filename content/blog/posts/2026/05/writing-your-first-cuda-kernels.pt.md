@@ -1,6 +1,6 @@
 ---
 title: "Escrevendo seus Primeiros Kernels CUDA: Execução na GPU, Memória e Otimização"
-date: 2026-05-31
+date: 2026-05-30
 description: "Um guia completo de programação CUDA do zero: indexação de threads, adição de vetores, multiplicação de matrizes com tiling em shared memory, atomics e streams assíncronos. Desenvolvido com RTX 5050 e CUDA 12.6."
 authors:
   - name: Luan Costa

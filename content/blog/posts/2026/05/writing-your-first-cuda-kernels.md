@@ -1,6 +1,6 @@
 ---
 title: "Writing Your First CUDA Kernels: GPU Execution, Memory, and Optimization"
-date: 2026-05-31
+date: 2026-05-30
 description: "A complete walkthrough of CUDA programming from the ground up: thread indexing, vector addition, tiled matrix multiplication with shared memory, atomics, and async streams. Built around an RTX 5050 and CUDA 12.6."
 authors:
   - name: Luan Costa

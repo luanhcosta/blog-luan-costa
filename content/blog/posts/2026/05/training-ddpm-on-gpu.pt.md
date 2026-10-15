@@ -1,235 +1,200 @@
 ---
 title: "Treinando um Modelo de Difusão do Zero: Execução na GPU e Comunicação CPU-GPU"
 date: 2026-05-31
-description: "Uma análise completa do treinamento de um DDPM no MNIST do zero, cobrindo a matemática da difusão, a arquitetura U-Net, e cada ponto onde CPU e GPU trocam dados durante o treino e a inferência. Todos os benchmarks rodados em uma RTX 5050."
+description: "Uma análise orientada por medições de como o PyTorch move dados e coordena CPU e GPU durante o treino e o sampling de um DDPM no MNIST."
 authors:
   - name: Luan Costa
 ---
 
-Modelos generativos estão entre as cargas de trabalho mais intensas em computação no deep learning. Entender não apenas se um modelo treina, mas *como* o hardware está sendo usado durante o treino, é o que separa código que funciona de código que roda bem.
+Um loop de treino em PyTorch parece sequencial: carregar um batch, movê-lo para a GPU, executar o modelo, calcular os gradientes e atualizar os pesos. CUDA não executa dessa forma. Em geral, o Python enfileira o trabalho e continua; a GPU consome esse trabalho de forma assíncrona até que o host solicite um resultado que precisa ler.
 
-Este post documenta a implementação completa de um Denoising Diffusion Probabilistic Model (DDPM) treinado no MNIST do zero, com foco específico na comunicação CPU-GPU: onde os dados se movem, quando CPU e GPU se sincronizam, e quais são os gargalos reais. Todas as medições foram coletadas em uma **NVIDIA GeForce RTX 5050 Laptop GPU** (Blackwell, 8 GB). O código completo está em [luanhcosta/ddpm-mnist](https://github.com/luanhcosta/ddpm-mnist).
+Este post acompanha uma carga de trabalho real — um Denoising Diffusion Probabilistic Model (DDPM) treinado no MNIST — para mostrar onde os bytes se movem, onde o Python apenas submete trabalho e onde CPU e GPU precisam esperar uma pela outra. O DDPM não é, intencionalmente, o assunto principal. Ele fornece uma carga pequena e visual cujos caminhos completos de treino e sampling são fáceis de inspecionar.
+
+Todas as medições foram coletadas em uma **NVIDIA GeForce RTX 5050 Laptop GPU** (Blackwell, 8 GB), usando PyTorch `2.12.0.dev20260407+cu128`, batch size 128 e quatro workers no DataLoader. O código e os scripts de benchmark estão disponíveis em [luanhcosta/ddpm-mnist](https://github.com/luanhcosta/ddpm-mnist).
 
 ---
 
-## O Processo Forward
+## A Carga de Trabalho em Uma Equação
 
-O DDPM enquadra a geração de imagens como a reversão de um processo de adição de ruído. O processo forward $q(x_t \mid x_0)$ corrompe progressivamente uma imagem limpa $x_0$ adicionando ruído gaussiano ao longo de $T$ timesteps:
+Durante o treino, uma imagem limpa $x_0$ é corrompida em um timestep aleatório $t$:
 
-$$x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \varepsilon, \quad \varepsilon \sim \mathcal{N}(0, I)$$
+$$x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\varepsilon,
+\qquad \varepsilon \sim \mathcal{N}(0,I)$$
 
-onde $\bar{\alpha}_t$ é o produto cumulativo do noise schedule:
+Uma U-Net com 9,7 milhões de parâmetros recebe $x_t$ e $t$ e aprende a prever $\varepsilon$ usando uma loss MSE. Esse é todo o contexto necessário para a discussão de sistemas: cada step transfere um batch de 128 imagens em escala de cinza com 28×28 pixels e depois executa forward pass, backward pass e uma atualização Adam na GPU.
 
-$$\bar{\alpha}_t = \prod_{s=1}^{t}(1 - \beta_s)$$
+O modelo funciona — depois de 100 épocas, ele gera dígitos reconhecíveis —, mas aqui ele serve principalmente como instrumento para observar o pipeline de execução.
 
-Com um schedule linear de $\beta_1 = 10^{-4}$ a $\beta_T = 0.02$ ao longo de $T = 1000$ steps, o schedule se comporta assim:
+{{< img src="images/samples_final.png" alt="64 dígitos semelhantes aos do MNIST gerados pelo DDPM treinado" >}}
 
-{{< img src="images/noise_schedule.png" alt="DDPM Linear Noise Schedule: β, ᾱ, amplitude de sinal/ruído e SNR" >}}
+---
 
-Três observações desse gráfico que informam tanto o treino quanto a inferência:
+## O Mapa de Um Step de Treino
 
-- As amplitudes de sinal e ruído se cruzam em **t ≈ 258**, menos de 26% do processo. Após esse ponto, o ruído já domina a imagem.
-- $\bar{\alpha}_t$ decai em forma de S, não linearmente. A maior parte do sinal é perdida nos primeiros 300 steps.
-- O SNR (canto inferior direito, escala log) colapsa exponencialmente. Em t = 500 ele já caiu três ordens de grandeza em relação ao valor inicial.
+A distinção útil não é apenas entre “código de CPU” e “código de GPU”. Existem três eventos diferentes:
 
-Todos esses valores são pré-computados uma vez na CPU e transferidos para a GPU na inicialização. Essa é uma decisão deliberada de design: o schedule nunca muda durante o treino, então não há razão para recomputá-lo a cada step.
+1. **Movimentação de dados:** bytes atravessam uma fronteira, como da RAM para a VRAM no batch de entrada ou da VRAM para a RAM em um escalar usado no logging.
+2. **Submissão de trabalho:** o Python pede ao CUDA que execute uma operação. A chamada pode retornar antes de a GPU terminá-la.
+3. **Sincronização:** a CPU precisa de um resultado da GPU e deve esperar até que o trabalho necessário seja concluído.
 
-```python
-# models/diffusion.py
-betas = make_beta_schedule(T, cfg.beta_start, cfg.beta_end, cfg.schedule)
-alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
+O caminho deste projeto se parece com isto:
 
-# Computado na CPU, transferido para GPU uma vez
-self.betas                         = betas.to(device)
-self.alphas_cumprod                = alphas_cumprod.to(device)
-self.sqrt_alphas_cumprod           = torch.sqrt(alphas_cumprod).to(device)
-self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).to(device)
+```text
+CPU / RAM                                      GPU / VRAM
+─────────                                      ──────────
+Workers do DataLoader
+    │
+    ├─ decodificam e transformam o MNIST
+    └─ preparam batch no host ── cópia H2D ────► tensor de entrada
+                                                   │
+Python submete operações de timestep/ruído ───────► q_sample
+Python submete operações do modelo ───────────────► forward + loss
+Python submete operações do autograd ─────────────► backward
+Python submete operações do otimizador ───────────► atualização Adam
+                                                   │
+loss.item() ◄──── cópia D2H do escalar + espera ───┘
 ```
 
-O efeito sobre um dígito real do MNIST:
-
-{{< img src="images/noising_trajectory.png" alt="Processo forward: um dígito 2 sendo progressivamente ruidizado em t=0, 100, 250, 500, 750, 999" >}}
-
-Em t = 250 a forma ainda é fracamente visível, coerente com o cruzamento do schedule em t ≈ 258. Em t = 500 o dígito já é irreconhecível, e em t = 999 é indistinguível de ruído gaussiano puro.
+As setas do Python para a GPU não significam que o Python espera depois de cada linha. As operações na mesma CUDA stream permanecem ordenadas, mas o host pode enfileirar várias operações antes que a GPU as conclua. Uma chamada como `loss.item()` muda essa relação porque o Python não consegue produzir o número até que o resultado exista na GPU.
 
 ---
 
-## O Modelo: U-Net com Condicionamento Temporal
+## Memória Pinned: Cópia Mais Rápida, Não Overlap Automático
 
-O processo reverso $p_\theta(x_{t-1} \mid x_t)$ é parametrizado por uma U-Net que prediz o ruído $\varepsilon$ adicionado no timestep $t$, treinada com uma loss MSE simples:
+A memória comum do host é paginável: o sistema operacional pode realocar ou enviar suas páginas para swap. O CUDA não pode executar com segurança uma transferência DMA assíncrona diretamente de uma memória cuja localização física pode mudar, então o driver pode precisar primeiro copiar os dados para uma região page-locked.
 
-$$\mathcal{L} = \mathbb{E}_{x_0,\, t,\, \varepsilon}\left[\lVert\varepsilon - \varepsilon_\theta(x_t, t)\rVert^2\right]$$
+A memória pinned é page-locked. Isso fornece ao driver CUDA uma origem estável para DMA e permite uma cópia H2D assíncrona. Em um DataLoader do PyTorch, `pin_memory=True` adiciona uma etapa no host que fixa a memória dos batches antes de retorná-los.
 
-A arquitetura para imagens 28×28 usa três níveis de resolução com um bottleneck em 7×7:
+O benchmark de largura de banda usa o mesmo buffer pré-alocado na GPU e a mesma operação `copy_` para as duas origens. Cada caso é executado 30 vezes; o gráfico calcula a largura de banda a partir da latência mediana. A ordem alterna entre memória paginável e pinned para reduzir viés causado por clock e temperatura.
 
-| Estágio | Resolução | Canais | Notas |
-|---|---|---|---|
-| Encoder L0 | 28×28 | 64 | 2× ResBlock |
-| Encoder L1 | 14×14 | 128 | 2× ResBlock |
-| Encoder L2 | 7×7 | 256 | 2× ResBlock + SelfAttention |
-| Bottleneck | 7×7 | 256 | ResBlock + SelfAttention + ResBlock |
-| Decoder L2→1 | 14×14 | 128 | upsample + 2× ResBlock |
-| Decoder L1→0 | 28×28 | 64 | upsample + 2× ResBlock |
+{{< img src="images/h2d_bandwidth.png" alt="Largura de banda host-to-device de memória paginável e pinned usando operações de cópia equivalentes" >}}
 
-Cada ResBlock recebe o embedding de timestep, uma codificação sinusoidal de $t$ projetada para 256 dimensões via MLP, somado ao feature map após a primeira convolução. É assim que o modelo distingue "denoise a partir de t=900" de "denoise a partir de t=50". Total de parâmetros: **9.744.641**.
+| Tamanho do tensor | Paginável | Pinned | Speedup com pinned |
+|---|---:|---:|---:|
+| 1 MB | 3,75 GB/s | 9,03 GB/s | 2,41× |
+| 10 MB | 4,63 GB/s | 8,81 GB/s | 1,90× |
+| 50 MB | 8,25 GB/s | 9,77 GB/s | 1,18× |
+| 100 MB | 8,37 GB/s | 9,76 GB/s | 1,17× |
+| 500 MB | 8,29 GB/s | 10,88 GB/s | 1,31× |
 
----
+A memória pinned melhora claramente a cópia isolada. O ganho relativo é maior quando o custo fixo de staging é relevante e diminui à medida que os dois caminhos se aproximam da largura de banda sustentada.
 
-## Comunicação CPU-GPU Durante o Treino
-
-Cada step de treino segue o pipeline padrão: carregar batch da CPU, transferir para a GPU, rodar o forward pass, calcular a loss, rodar o backward pass, atualizar os pesos. A questão é onde o tempo realmente vai.
-
-### Largura de Banda de Transferência Host-para-Device
-
-Antes de um tensor poder ser processado pela GPU, ele precisa ser copiado da RAM para a VRAM. Essa transferência atravessa o barramento PCIe, e sua velocidade depende de como a memória do host é gerenciada pelo SO.
-
-Por padrão, o SO aloca **memória paginável**: memória que o sistema de memória virtual pode mover para o disco ou realocar a qualquer momento. Antes de transferir memória paginável para a GPU, o driver CUDA precisa primeiro fazer uma cópia temporária em um local fixo e depois copiar esse conteúdo para a VRAM. Essa cópia intermediária é o overhead.
-
-**Memória pinned (page-locked)** (`cudaMallocHost` em CUDA, `pin_memory=True` no PyTorch) diz ao SO que uma região de memória nunca deve ser movida ou trocada. Com essa garantia, o motor DMA da GPU pode ler diretamente do endereço físico sem a cópia intermediária. A transferência se torna um verdadeiro Direct Memory Access, contornando a CPU inteiramente.
-
-Definir `pin_memory=True` no DataLoader pré-aloca os tensores do host como pinned para que a transferência DMA possa começar imediatamente quando o batch é enviado para a GPU:
+O código de treino usa:
 
 ```python
-# data/dataset.py
-return DataLoader(
-    dataset,
-    batch_size=cfg.batch_size,
-    num_workers=cfg.num_workers,
-    pin_memory=use_pin,   # pré-aloca tensores do host como page-locked
-    persistent_workers=cfg.num_workers > 0,
-)
+x = x.to(device, non_blocking=True)
 ```
 
-O ganho real de bandwidth depende muito do tamanho do tensor:
+Para uma origem pinned, isso permite que a chamada no host retorne sem esperar a cópia terminar. Isso **não** significa, por si só, que a cópia se sobrepõe à computação da GPU. A cópia e as operações seguintes do modelo usam a default stream neste projeto, portanto permanecem ordenadas. A sobreposição com o batch anterior ou seguinte exige um pipeline explícito — normalmente prefetching ou double buffering, uma CUDA stream separada e sincronização correta entre streams.
 
-{{< img src="images/h2d_bandwidth.png" alt="Bandwidth H2D: memória pageable vs pinned em diferentes tamanhos de tensor" >}}
+---
 
-Em **1 MB**, memória pinned é **2.5× mais rápida** (17.3 vs 6.9 GB/s) porque o overhead da cópia intermediária domina transferências pequenas. Em **10 MB**, a diferença quase desaparece (10.6 vs 10.9 GB/s): ambos os caminhos agora saturam a mesma largura de banda do barramento PCIe (~11 GB/s). Em **500 MB**, pinned recupera uma vantagem de 1.24× com a eficiência sustentada do DMA numa transferência longa.
+## Microbenchmark versus Pipeline de Entrada
 
-Para batches do MNIST (batch size 128, imagens 28×28 float32 = ~400 KB por batch), estamos firmemente no regime de tensor pequeno onde memória pinned tem mais impacto.
+Uma versão anterior deste experimento se apresentava como benchmark de “throughput do DataLoader”, embora cronometrasse apenas `.to(device)`. O benchmark revisado separa duas perguntas:
 
-### Throughput do DataLoader
+- **Somente transferência:** o batch já foi produzido; mede-se apenas H2D.
+- **Loop somente de entrada:** mede-se `next(iterator)` junto da cópia H2D e espera-se sua conclusão.
 
-Memória pinned habilita uma segunda otimização: **transferências non-blocking**. Ao chamar `.to(device, non_blocking=True)` em um tensor pinned, a GPU inicia a cópia DMA e a CPU retorna imediatamente ao Python sem esperar ela terminar. Isso sobrepõe a transferência do batch atual com o que a GPU está fazendo do step anterior, efetivamente escondendo a latência H2D atrás da computação.
+{{< img src="images/dataloader_comparison.png" alt="Comparação de memória pinned em uma transferência isolada e em um loop de entrada do DataLoader" >}}
+
+Para o batch real do MNIST, a memória pinned reduziu a latência mediana da transferência isolada de **0,260 ms para 0,158 ms**. No loop deliberadamente limitado à entrada, porém, a mediana foi de **0,600 ms para memória paginável e 3,226 ms para pinned**.
+
+Isso não é uma contradição. Fazer o pinning também exige trabalho no host, e esse loop quase não oferece computação com a qual esconder esse custo. O resultado também mostra por que um microbenchmark não deve ser apresentado como throughput end-to-end. O benefício para a aplicação depende do tamanho do batch, do comportamento dos workers, do prefetching e de quanto trabalho a GPU executa entre duas solicitações de batch.
+
+A latência de cauda conta outra parte da história: nesta execução, o p95 foi de 28,58 ms para a entrada paginável e 17,54 ms para pinned. Uma única média ou taxa de throughput esconderia tanto o overhead quanto a variabilidade.
+
+---
+
+## Medindo CUDA sem Medir Apenas o Dispatch
+
+Este padrão de medição normalmente está errado para trabalho na GPU:
 
 ```python
-# training/trainer.py — início de cada step de treino
-x = x.to(self.device, non_blocking=self.cfg.data.pin_memory)
+start = time.perf_counter()
+y = model(x)
+elapsed = time.perf_counter() - start
 ```
 
-O `non_blocking=True` aqui só é significativo porque `pin_memory=True` está definido no DataLoader. Sem memória pinned, o PyTorch ignora o flag e cai num comportamento de cópia bloqueante.
-
-{{< img src="images/dataloader_comparison.png" alt="Throughput do DataLoader: pin_memory=True vs False" >}}
-
-`pin_memory=True` entrega **1.78× mais throughput**: 14.662 vs 8.292 batches/segundo, ou 0,068 vs 0,121 ms por batch. Para um loop de treino que processa ~460 batches por época, isso economiza ~24 ms por época. Modesto isoladamente, mas gratuito.
-
-### Onde o Tempo Realmente Vai em um Step de Treino
-
-O loop de treino usa **AMP (Automatic Mixed Precision)**, que roda os passes forward e backward em float16 em vez de float32 onde é seguro fazê-lo. Isso reduz pela metade o tamanho das ativações e gradientes na memória, dobrando aproximadamente a largura de banda efetiva disponível para operações matriciais. A GPU passa menos tempo esperando operandos e mais tempo computando.
+Ele pode medir quanto tempo o Python levou para enfileirar os kernels, e não quanto tempo os kernels levaram para executar. O benchmark delimita cada fase com sincronização:
 
 ```python
-# training/trainer.py — forward + backward com AMP
-self.optimizer.zero_grad(set_to_none=True)
-
-with torch.cuda.amp.autocast():           # operações rodam em float16
-    loss = self.diffusion.loss(self.model, x, t)
-
-self.scaler.scale(loss).backward()        # loss escalada para evitar underflow
-self.scaler.unscale_(self.optimizer)
-nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.gradient_clip)
-self.scaler.step(self.optimizer)
-self.scaler.update()
-
-loss_val = loss.item()  # ponto de sync: força a GPU a terminar antes de ler o escalar
+torch.cuda.synchronize()
+start = time.perf_counter()
+y = model(x)
+torch.cuda.synchronize()
+elapsed = time.perf_counter() - start
 ```
 
-A última linha merece atenção. `loss.item()` retorna um float Python de um tensor GPU. Para isso, a CPU precisa esperar a GPU terminar de computar a loss. Esse é um **ponto de sincronização**: uma operação que quebra a relação normalmente assíncrona entre CPU e GPU. Aqui é necessário porque precisamos do valor da loss para registrá-lo, mas é um custo.
+CUDA Events são outra boa opção para medir tempo no device. Aqui, a sincronização explícita é usada porque o objetivo é dividir um step completo em fases de wall-clock fáceis de interpretar.
 
-{{< img src="images/training_breakdown.png" alt="Breakdown do step de treino: data H2D, forward, loss, backward, optimizer" >}}
+O breakdown agora reproduz o caminho real do treino: AMP autocast, GradScaler, gradient clipping e Adam. A operação de noising do forward process está incluída, e o batch é transferido exatamente uma vez.
 
-Com média de 100 steps com o modelo treinado:
+{{< img src="images/training_breakdown.png" alt="Breakdown de um step AMP mostrando H2D, noising, forward, loss, backward e otimizador" >}}
 
-| Fase | Tempo | Parcela |
-|---|---|---|
-| data H2D | 0,08 ms | **0,0%** |
-| amostragem de ruído + timestep | 0,05 ms | 0,0% |
-| forward pass | 70,1 ms | 32,8% |
-| loss | 0,09 ms | 0,0% |
-| backward pass | 140,4 ms | **65,8%** |
-| optimizer step | 2,7 ms | 1,3% |
-| **Total** | **213,5 ms** | |
+| Fase | Tempo | Participação |
+|---|---:|---:|
+| dados H2D | 0,134 ms | 0,1% |
+| ruído + `q_sample` | 0,270 ms | 0,2% |
+| forward | 47,099 ms | 33,4% |
+| loss | 0,222 ms | 0,2% |
+| backward | 87,023 ms | 61,8% |
+| otimizador + clipping | 6,119 ms | 4,3% |
+| **Total** | **140,867 ms** | **100%** |
 
-O backward pass domina porque precisa calcular um gradiente para cada um dos 9,7M parâmetros, uma derivada parcial por peso, por amostra no batch. Isso é uma quantidade enorme de trabalho multiply-accumulate inteiramente na GPU. O forward pass custa aproximadamente a metade porque roda a computação em apenas uma direção. O backward efetivamente reproduz o mesmo grafo computacional em sentido inverso enquanto armazena resultados intermediários.
+Para esta carga de trabalho, H2D não é o gargalo do treino. Mesmo uma grande melhoria relativa em uma fase que representa 0,1% dificilmente altera o step completo. A computação do backward domina.
 
-A transferência de dados CPU para GPU é **três ordens de grandeza menor** que o backward pass. Para um modelo de ~10M parâmetros em imagens 28×28, o gargalo é o cálculo do gradiente, não a comunicação de memória. Otimizar o carregamento de dados aqui seria otimizar os 0,0% ignorando os 65,8%.
-
----
-
-## Resultados do Treino
-
-100 épocas, Adam com lr=2e-4, batch size 128, AMP (float16), gradient clipping em 1.0.
-
-{{< img src="images/loss_curve.png" alt="Loss de treino do DDPM ao longo de 47.000 steps" >}}
-
-A loss cai abruptamente nos primeiros ~2.000 steps e depois entra em uma longa fase de refinamento estável. Nenhuma instabilidade. Essa é uma das vantagens estruturais do DDPM sobre GANs: há apenas uma rede para treinar, e o landscape da loss MSE é bem comportado. O modelo atingiu sua loss final de ~0,02 e permaneceu lá pelas últimas 80 épocas.
-
-Após 100 épocas, amostrando 64 imagens a partir de ruído gaussiano puro:
-
-{{< img src="images/samples_final.png" alt="64 imagens geradas pelo DDPM treinado a partir de ruído puro" >}}
-
-Todas as 10 classes de dígitos aparecem com traços limpos e sem mode collapse. Algumas amostras são ambíguas porque o modelo aprendeu a distribuição completa de estilos de escrita, não apenas formas canônicas.
+O total das fases sincronizadas serve para explicar onde o tempo do device é gasto; ele não significa que inserir uma sincronização entre cada fase seja a forma ideal de executar o treino.
 
 ---
 
-## Inferência: O Custo de Comunicação de 1000 Steps
+## Observar a GPU pelo Host Também É Comunicação
 
-Gerar uma imagem com DDPM requer 1000 avaliações sequenciais do modelo, uma por timestep reverso. Isso cria uma questão natural: qual é o custo de sincronizar CPU e GPU a cada step?
-
-Para responder isso, é preciso entender como CPU e GPU se relacionam durante a execução. Quando o Python chama uma operação de GPU, a CPU não espera a GPU terminar. Ela submete o trabalho a uma **fila de comandos da GPU** (um CUDA stream) e imediatamente continua executando Python. A GPU drena a fila de forma independente, potencialmente executando kernels lançados vários statements Python atrás. Essa relação assíncrona é o que torna a programação de GPU rápida: CPU e GPU rodam em paralelo em vez de se revezar.
-
-Um **ponto de sincronização** quebra esse modelo. Qualquer operação que exige que a CPU leia um valor computado pela GPU força um `cudaDeviceSynchronize()`: a CPU para, espera a GPU completar todo trabalho pendente, lê o resultado, e só então retoma. Em um loop fechado, isso colapsa o paralelismo CPU-GPU em execução sequencial.
-
-As duas funções de sampling no repositório tornam essa diferença concreta ao isolar exatamente o que muda entre as versões:
+O sampling expõe outra fronteira. Um DDPM realiza 1.000 avaliações dependentes do modelo. O Python pode continuar submetendo trabalho sem ler os tensores intermediários, mas código de monitoramento frequentemente materializa um valor no host:
 
 ```python
-# sampling/sampler.py — naive_sync: força sync a cada step
-for t_idx in reversed(range(diffusion.T)):
-    predicted_noise = model(x, t_batch)
-    mean = diffusion.p_mean(predicted_noise, x, t_batch)
-    x = mean + torch.sqrt(variance) * noise
-    _ = x.mean().item()  # cudaDeviceSynchronize() — executado 1000 vezes
-
-# sampling/sampler.py — no_sync: GPU roda continuamente
-for t_idx in reversed(range(diffusion.T)):
-    predicted_noise = model(x, t_batch)
-    mean = diffusion.p_mean(predicted_noise, x, t_batch)
-    x = mean + torch.sqrt(variance) * noise
-    # sem sync: a GPU enfileira todos os 1000 lançamentos de kernel sem interrupção
-
-torch.cuda.synchronize()  # um único sync ao final
+stat = x.mean().item()
 ```
 
-{{< img src="images/sampling_comparison.png" alt="Tempo de sampling: DDPM-1000 com syncs forçados vs GPU pura, vs DDIM-50" >}}
+Isso não mede uma “sincronização pura”. A operação adiciona uma redução na GPU, uma cópia D2H do escalar e a espera necessária para produzir um número Python. Essa combinação representa exatamente o que logging ou monitoramento de progresso pode acrescentar a um loop real.
 
-O resultado para esse modelo: o overhead de sync é **1,04×** — 3,94s vs 3,78s. As 1000 chamadas a `.item()` adicionam cerca de 160 ms ao longo do loop completo.
+O experimento revisado observa o tensor nunca, a cada 100 steps, a cada 10 steps ou em todos os steps. Ele executa um sampling completo de warmup, alterna a ordem dos casos ao longo de cinco rodadas e reporta a mediana.
 
-Isso é menor do que o esperado, e o motivo é informativo. O forward pass da U-Net em uma entrada 28×28 leva ~70 ms (conforme medido no breakdown do treino). Cada sync forçado adiciona ~0,16 ms, menos de 0,25% do tempo de execução do kernel por step. Quando a GPU está fazendo trabalho substancial, o overhead de sincronização se torna relativamente barato, porque a CPU passa a maior parte do tempo esperando de qualquer forma.
+{{< img src="images/sampling_comparison.png" alt="Tempo de sampling do DDPM para diferentes frequências de observação pelo host" >}}
 
-A solução estrutural é o **DDIM**, uma reformulação do processo reverso que alcança qualidade de amostra equivalente em 50 steps em vez de 1000, escolhendo deterministicamente uma trajetória de steps pulados através do mesmo modelo treinado. O speedup é **19,2×** (0,20s vs 3,78s). Reduzir a contagem de steps de 1000 para 50 é muito mais eficaz do que eliminar o overhead de sincronização.
+| Frequência de observação | Tempo do DDPM-1000 |
+|---|---:|
+| nunca | 4,740 s |
+| a cada 100 steps | 4,729 s |
+| a cada 10 steps | 4,709 s |
+| em todos os steps | 4,844 s |
+
+Observar todos os steps adicionou aproximadamente **104 ms**, ou **2%**, em relação ao caso sem observação intermediária. As diferenças entre os casos intermediários estão dentro da variação normal entre execuções; o resultado importante é que até 1.000 observações no host custaram pouco diante de 1.000 avaliações da U-Net nesta máquina.
+
+Esse resultado é específico desta carga. Kernels menores, um modelo mais rápido, estatísticas mais caras ou um serviço sensível a latência podem tornar o mesmo padrão de sincronização muito mais importante.
+
+Para dar escala à comparação, DDIM com 50 avaliações do modelo levou **0,241 s**, um speedup de 19,7× sobre o baseline DDPM de 1.000 steps. Isso não é uma otimização de comunicação: ele remove 95% das avaliações do modelo. O resultado está incluído para mostrar a diferença entre otimizar overhead de coordenação e remover a computação dominante.
 
 ---
 
-## O Processo de Denoising
+## Onde o Modelo Ainda Importa
 
-{{< img src="images/denoising.gif" alt="8 amostras sendo denoised de ruído puro a dígitos reconhecíveis" >}}
+O DDPM continua sendo útil porque seu loop de sampling é sequencial e sua saída é fácil de inspecionar. A animação abaixo captura oito tensores da GPU para a CPU a cada 100 steps para visualização — outra transferência device-to-host explícita que não existiria em um sampler de produção se não fosse solicitada.
 
-Oito amostras geradas em paralelo, capturadas a cada 100 steps. O primeiro frame é ruído puro. Pelos primeiros ~700 steps, os frames permanecem indistinguíveis de estática, coerente com o noise schedule: o SNR é tão baixo que o modelo está operando quase inteiramente no regime de ruído. A estrutura só se compromete nos últimos 200-300 steps, quando $\bar{\alpha}_t$ é grande o suficiente para que o gradiente da função de score direcione para formas reconhecíveis.
+{{< img src="images/denoising.gif" alt="Oito amostras progredindo de ruído Gaussiano para dígitos reconhecíveis" >}}
 
-Esse comprometimento tardio não é uma falha do treino. É o modelo seguindo fielmente o schedule com o qual foi treinado.
+O modelo, a curva de loss, o checkpoint, as imagens geradas, o JSON bruto dos benchmarks e os scripts que regeneram os gráficos estão no repositório. A principal lição é mais ampla que modelos de difusão:
+
+> Otimize o caminho completo de execução, não uma cópia isolada. Saiba se uma linha move bytes, submete trabalho ou força o host a esperar — e então meça a fronteira que realmente importa.
 
 ---
 
-## Código
+## Reproduzindo as Medições
 
-Implementação completa, benchmarks e scripts de treino em [luanhcosta/ddpm-mnist](https://github.com/luanhcosta/ddpm-mnist). O `scripts/benchmark.py` reproduz todas as medições de tempo deste post, e o `scripts/generate_assets.py` gera os gráficos conceituais sem precisar de um modelo treinado.
+```bash
+python scripts/benchmark.py \
+  --checkpoint results/checkpoints/epoch_100.pt \
+  --assets-dir /caminho/para/blog/static/images
+```
+
+O comando registra os metadados do ambiente em `results/profiling/benchmarks.json`, gera os quatro gráficos de benchmark e exporta um trace do PyTorch Profiler. Implementação completa: [luanhcosta/ddpm-mnist](https://github.com/luanhcosta/ddpm-mnist).
